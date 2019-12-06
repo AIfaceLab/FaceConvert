@@ -8,6 +8,7 @@ from Modules import PredicterBase, PredicterDeepfakes
 import time
 from pathlib import Path
 import os
+from face_compare import FaceCompare
 
 
 class ConvertImages(SubprocessorBase):
@@ -25,9 +26,10 @@ class ConvertImages(SubprocessorBase):
             def on_initialize(self):
                 self.fa = FaceAlignment(
                     LandmarksType._2D, device=self.device)
+                self.facecompare = FaceCompare(device=self.device)
 
-            def face_compare(self, face_rgb_list):
-                return face_rgb_list[0]
+            # def face_compare(self, face_rgb_list):
+            #     return face_rgb_list[0]
 
             def preprocess_image(self, image_rgb, landmark, face):
                 h, w = np.shape(face)[:2]
@@ -46,10 +48,10 @@ class ConvertImages(SubprocessorBase):
                 frontface_mask = cv2.warpAffine(
                     mask, face_mat, (h, w), flags=cv2.INTER_LANCZOS4)
 
-                cv2.imshow("src_face", cv2.cvtColor(face, cv2.COLOR_RGB2BGR))
-                cv2.imshow("obj_face", cv2.cvtColor(
-                    frontface_image, cv2.COLOR_RGB2BGR))
-                cv2.waitKey(1)
+                # cv2.imshow("src_face", cv2.cvtColor(face, cv2.COLOR_RGB2BGR))
+                # cv2.imshow("obj_face", cv2.cvtColor(
+                #     frontface_image, cv2.COLOR_RGB2BGR))
+                # cv2.waitKey(1)
 
                 # face ,the shape is same as image_rgb
                 swapped_face_image = cv2.warpAffine(face, face_output_mat, (image_rgb.shape[1], image_rgb.shape[0]), np.zeros(
@@ -60,11 +62,12 @@ class ConvertImages(SubprocessorBase):
                 mask_image_rgb = cv2.warpAffine(mask_rgb, face_output_mat, (image_rgb.shape[1], image_rgb.shape[0]), np.zeros(
                     image_rgb.shape, dtype=np.float32), flags=cv2.WARP_INVERSE_MAP | cv2.INTER_LANCZOS4)
 
-                out = {}
-                out["image_rgb"] = image_rgb
-                out["image_mask"] = mask_image_rgb
-                out["image_face"] = swapped_face_image
-                return out
+                out_dict = {}
+                out_dict["image_rgb"] = image_rgb
+                out_dict["image_mask"] = mask_image_rgb
+                out_dict["image_face"] = swapped_face_image
+                out_dict["compare_face"] = frontface_image
+                return out_dict
 
             def postprocess(self, image_rgb, mask_image_rgb, swapped_face_image):
                 # -----------------------------seamless clone-----------------------------------------------
@@ -90,12 +93,62 @@ class ConvertImages(SubprocessorBase):
                 # ------------------------------------------------------------------------------------------
                 return seamless_out
 
+            def face_compare(self, out_list):
+                # the face must be rgb and (0~255)
+                scores_list = []
+                for out_dict in out_list:
+                    scores_list.append(self.facecompare(
+                        out_dict['compare_face'], self.standard_face))
+                # find the suitable faces
+                suitable_faces_preprocess_out = [
+                    out_list[i] for i in self._find_compared_face_strategy(scores_list)]
+                return suitable_faces_preprocess_out
+
             def convert_face(self, image_rgb, face):
                 landmarks = self.fa.get_landmarks(image_rgb)
                 print(len(landmarks))
+                # get all faces in the image and put them in a list
+                preprocess_out_list = []
                 for landmark in landmarks:
-                    out = self.preprocess_image(image_rgb, landmark, face)
-                    return self.postprocess(out['image_rgb'], out["image_mask"], out["image_face"])
+                    out_dict = self.preprocess_image(
+                        image_rgb, landmark, face)
+                    preprocess_out_list.append(out_dict)
+                # select the suitable faces
+                suitable_preprocess_out = self.face_compare(
+                    preprocess_out_list)
+                result_image = self._processe_suitable_out(
+                    suitable_preprocess_out)
+                if result_image is not None:
+                    return result_image
+                else:
+                    return image_rgb
+
+            def _processe_suitable_out(self, input_):
+                if len(input_) == 0:
+                    '''no face suitable'''
+                    print("no face detected")
+                    return None
+                if len(input_) == 1:
+                    return self.postprocess(input_[0]['image_rgb'], input_[0]["image_mask"], input_[0]["image_face"])
+                else:
+                    temp_dict = input_[0]
+                    postprocessed_out = self.postprocess(
+                        temp_dict["image_rgb"], temp_dict["image_mask"], temp_dict["image_face"])
+                    next_input = input_[1:]
+                    next_input[0]["image_rgb"] = postprocessed_out
+                    return self._processe_suitable_out()
+
+            def _find_compared_face_strategy(self, scores_list, threshold=0.74):
+                '''
+                you should design greater strategy
+                '''
+                # threshold_results = [
+                #     x if x >= threshold else 0 for x in scores_list]
+                print("scores_list :", scores_list)
+                if max(scores_list) > threshold:
+                    return [scores_list.index(max(scores_list))]
+                else:
+                    return []
 
             def __call__(self, image_rgb, face):
                 return self.convert_face(image_rgb, face)
@@ -105,25 +158,33 @@ class ConvertImages(SubprocessorBase):
             idx, image_path_dict = data
             image = cv2.imread(image_path_dict['input_image_path'])
             face = cv2.imread(image_path_dict['input_face'])
+
+            image = cv2.resize(image, (0, 0), fx=0.25, fy=0.25)
+            face = cv2.resize(face, (0, 0), fx=0.25, fy=0.25)
+
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             face = cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
             out = self.converter(image, face)
 
             out = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
-            print(image_path_dict['input_image_path'],
-                  Path(image_path_dict['input_image_path']).name)
             out_path = os.path.join(image_path_dict['output_dir'], Path(
                 image_path_dict['input_image_path']).name)
-            cv2.imshow("result", out.astype(np.uint8))
+            cv2.imshow("result", cv2.resize(
+                out.astype(np.uint8), (0, 0), fx=0.25, fy=0.25))
             cv2.imwrite(out_path, out.astype(np.uint8))
             cv2.waitKey(1)
 
         def on_cli_initialize(self, client_dict):
-            self.converter = ConvertImages.Cli.Converter(
-                transformed_fixed_size=client_dict['face_fixed_size'], device=client_dict['converter_device'])
+            # --------------------------------------------------------------------------------------
+            # 今天要写这里
+            standard_face = cv2.imread(client_dict['standard_face_path'][0])
+            standard_face = cv2.cvtColor(standard_face, cv2.COLOR_BGR2RGB)
+            # --------------------------------------------------------------------------------------
+            self.converter = ConvertImages.Cli.Converter(standard_face=standard_face,
+                                                         transformed_fixed_size=client_dict['face_fixed_size'], device=client_dict['converter_device'])
             # time.sleep(5)
 
-    def __init__(self, img_path_list, face_path_list, face_fixed_size=(256, 256), output_dir='results', workers=1, converter_device="cuda"):
+    def __init__(self, img_path_list, face_path_list, standardface_path_list, face_fixed_size=(256, 256), output_dir='results', workers=1, converter_device="cuda"):
         '''
             src_image_path_list, the face which will be the output \n
             [obj_img_path_list]  the actor's faces\n
@@ -135,6 +196,7 @@ class ConvertImages(SubprocessorBase):
         '''
         self.imgs = img_path_list
         self.faces = face_path_list
+        self.standard_face = standardface_path_list
         self.input_data_idxs = [*range(len(img_path_list))]
         self.num_subprocessers = workers
         self.converter_device = converter_device
@@ -173,5 +235,6 @@ class ConvertImages(SubprocessorBase):
                                       'device_name': 'CPU%d' % (i),
                                       'face_fixed_size': self.face_fixed_size,
                                       'converter_device': self.converter_device,
-                                      'output_dir': self.output_dir
+                                      'output_dir': self.output_dir,
+                                      'standard_face_path': self.standard_face
                                       }
